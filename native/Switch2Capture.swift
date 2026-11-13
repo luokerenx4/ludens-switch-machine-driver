@@ -422,13 +422,15 @@ if !headless && !isPreviewClient {
 }
 
 final class VideoView: NSView {
+    let rootLayer = CALayer()
     let preview = AVCaptureVideoPreviewLayer()
     let remoteLayer = CALayer()
 
     override init(frame: NSRect) {
         super.init(frame: frame)
-        wantsLayer = true
-        layer?.backgroundColor = NSColor.black.cgColor
+        rootLayer.backgroundColor = NSColor.black.cgColor
+        self.layer = rootLayer
+        self.wantsLayer = true
 
         preview.videoGravity = .resizeAspect
         remoteLayer.contentsGravity = .resizeAspect
@@ -441,8 +443,8 @@ final class VideoView: NSView {
         ]
         remoteLayer.isHidden = true
 
-        layer?.addSublayer(preview)
-        layer?.addSublayer(remoteLayer)
+        rootLayer.addSublayer(preview)
+        rootLayer.addSublayer(remoteLayer)
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -451,10 +453,24 @@ final class VideoView: NSView {
         preview.session = nil
         preview.isHidden = true
         remoteLayer.isHidden = false
+        remoteLayer.frame = bounds
     }
 
     func displayRemoteImage(_ image: CGImage) {
+        if remoteLayer.frame != bounds {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            remoteLayer.frame = bounds
+            CATransaction.commit()
+        }
         remoteLayer.contents = image
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
+        rootLayer.contentsScale = scale
+        remoteLayer.contentsScale = scale
     }
 
     override func layout() {
@@ -1106,28 +1122,23 @@ final class HttpServer: NSObject, @unchecked Sendable {
     }
 }
 
-final class RemotePreviewClient: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+final class RemotePreviewClient: @unchecked Sendable {
     let baseURL: String
     let onFrame: @Sendable (CGImage, String, String?) -> Void
     let onReconnecting: @Sendable (String) -> Void
 
-    private let delegateQueue: OperationQueue = {
-        let q = OperationQueue()
-        q.name = "switch2.preview.stream"
-        q.maxConcurrentOperationCount = 1
-        q.qualityOfService = .userInteractive
-        return q
-    }()
-    private var urlSession: URLSession?
-    private var streamTask: URLSessionDataTask?
+    private let streamQueue = DispatchQueue(label: "switch2.preview.stream", qos: .userInteractive)
+    private var connection: NWConnection?
     private var statusTimer: DispatchSourceTimer?
     private var watchdogTimer: DispatchSourceTimer?
     private var stopped = false
     private var reconnectPending = false
     private var streamActive = false
+    private var httpHeaderParsed = false
     private var buffer = Data()
     private var boundary = "frame"
     private var lastFrameAt: TimeInterval = 0
+    private var connectStartedAt: TimeInterval = 0
 
     private var remoteDeviceName: String?
     private var remoteMode: String?
@@ -1148,37 +1159,30 @@ final class RemotePreviewClient: NSObject, URLSessionDataDelegate, @unchecked Se
         self.baseURL = baseURL
         self.onFrame = onFrame
         self.onReconnecting = onReconnecting
-        super.init()
     }
 
     func start() {
-        delegateQueue.addOperation { [weak self] in
+        streamQueue.async { [weak self] in
             guard let self, !self.stopped else { return }
-            let config = URLSessionConfiguration.ephemeral
-            config.timeoutIntervalForRequest = 2.5
-            config.timeoutIntervalForResource = 604800
-            config.urlCache = nil
-            config.requestCachePolicy = .reloadIgnoringLocalCacheData
-            self.urlSession = URLSession(configuration: config, delegate: self, delegateQueue: self.delegateQueue)
-
             self.startTimers()
             self.connectStreamNow()
-            self.pollRemoteStatus()
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                self?.pollRemoteStatus()
+            }
         }
     }
 
     func stop() {
-        delegateQueue.addOperation { [weak self] in
+        streamQueue.async { [weak self] in
             guard let self, !self.stopped else { return }
             self.stopped = true
             self.statusTimer?.cancel()
             self.statusTimer = nil
             self.watchdogTimer?.cancel()
             self.watchdogTimer = nil
-            self.streamTask?.cancel()
-            self.streamTask = nil
-            self.urlSession?.invalidateAndCancel()
-            self.urlSession = nil
+            self.connection?.stateUpdateHandler = nil
+            self.connection?.cancel()
+            self.connection = nil
             self.buffer.removeAll(keepingCapacity: false)
         }
     }
@@ -1192,16 +1196,15 @@ final class RemotePreviewClient: NSObject, URLSessionDataDelegate, @unchecked Se
         statusTimer.resume()
         self.statusTimer = statusTimer
 
-        let watchdog = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .userInitiated))
+        let watchdog = DispatchSource.makeTimerSource(queue: streamQueue)
         watchdog.schedule(deadline: .now() + 1.0, repeating: 0.5)
         watchdog.setEventHandler { [weak self] in
-            guard let self else { return }
-            self.delegateQueue.addOperation { [weak self] in
-                guard let self, !self.stopped else { return }
-                let now = ProcessInfo.processInfo.systemUptime
-                if self.streamActive && self.lastFrameAt > 0 && (now - self.lastFrameAt) > 2.2 {
-                    self.handleDisconnect()
-                }
+            guard let self, !self.stopped else { return }
+            let now = ProcessInfo.processInfo.systemUptime
+            if self.streamActive && self.lastFrameAt > 0 && (now - self.lastFrameAt) > 2.5 {
+                self.handleDisconnect()
+            } else if !self.streamActive && self.connection != nil && self.connectStartedAt > 0 && (now - self.connectStartedAt) > 3.0 {
+                self.handleDisconnect()
             }
         }
         watchdog.resume()
@@ -1210,7 +1213,7 @@ final class RemotePreviewClient: NSObject, URLSessionDataDelegate, @unchecked Se
 
     private func pollRemoteStatus() {
         if let status = probeCaptureServiceStatus(baseURL: baseURL, timeout: 0.4) {
-            delegateQueue.addOperation { [weak self] in
+            streamQueue.async { [weak self] in
                 guard let self, !self.stopped else { return }
                 if let dev = status.device, !dev.isEmpty {
                     self.remoteDeviceName = dev
@@ -1229,32 +1232,77 @@ final class RemotePreviewClient: NSObject, URLSessionDataDelegate, @unchecked Se
     }
 
     private func connectStreamNow() {
-        guard !stopped, let urlSession else { return }
+        guard !stopped else { return }
         reconnectPending = false
-        streamTask?.cancel()
+        connection?.stateUpdateHandler = nil
+        connection?.cancel()
+        connection = nil
+        httpHeaderParsed = false
         buffer.removeAll(keepingCapacity: true)
         boundary = "frame"
 
-        guard let streamURL = URL(string: "\(baseURL)/stream?fps=60") else {
+        guard let parsed = URL(string: baseURL),
+              let host = parsed.host, !host.isEmpty else {
             onReconnecting("Invalid capture service URL: \(baseURL)")
             return
         }
-        var req = URLRequest(url: streamURL)
-        req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-        req.timeoutInterval = 2.5
-        let task = urlSession.dataTask(with: req)
-        self.streamTask = task
-        task.resume()
+        let portNum = UInt16(clamping: parsed.port ?? (parsed.scheme == "https" ? 443 : 80))
+        guard let nwPort = NWEndpoint.Port(rawValue: portNum) else {
+            onReconnecting("Invalid capture service port: \(baseURL)")
+            return
+        }
+
+        connectStartedAt = ProcessInfo.processInfo.systemUptime
+        let conn = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: .tcp)
+        self.connection = conn
+
+        conn.stateUpdateHandler = { [weak self, weak conn] state in
+            guard let self, let conn, conn === self.connection, !self.stopped else { return }
+            switch state {
+            case .ready:
+                let req = "GET /stream?fps=60 HTTP/1.1\r\nHost: \(host):\(portNum)\r\nAccept: multipart/x-mixed-replace\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"
+                conn.send(content: Data(req.utf8), completion: .contentProcessed { [weak self, weak conn] err in
+                    guard let self, let conn, conn === self.connection, !self.stopped else { return }
+                    if err != nil {
+                        self.handleDisconnect()
+                        return
+                    }
+                    self.receiveNextChunk(from: conn)
+                })
+            case .failed, .cancelled:
+                self.handleDisconnect()
+            default:
+                break
+            }
+        }
+        conn.start(queue: streamQueue)
+    }
+
+    private func receiveNextChunk(from conn: NWConnection) {
+        conn.receive(minimumIncompleteLength: 1, maximumLength: 262_144) { [weak self, weak conn] data, _, isComplete, error in
+            guard let self, let conn, conn === self.connection, !self.stopped else { return }
+            if let data, !data.isEmpty {
+                self.processIncomingBytes(data)
+                if conn !== self.connection { return }
+            }
+            if error != nil || isComplete {
+                self.handleDisconnect()
+                return
+            }
+            self.receiveNextChunk(from: conn)
+        }
     }
 
     private func handleDisconnect() {
         guard !stopped else { return }
         streamActive = false
+        httpHeaderParsed = false
         measuredFpsStart = 0
         measuredFpsCount = 0
         measuredFps = 0
-        streamTask?.cancel()
-        streamTask = nil
+        connection?.stateUpdateHandler = nil
+        connection?.cancel()
+        connection = nil
         buffer.removeAll(keepingCapacity: true)
         onReconnecting("Reconnecting to capture service… (\(baseURL))")
         scheduleReconnect()
@@ -1263,48 +1311,47 @@ final class RemotePreviewClient: NSObject, URLSessionDataDelegate, @unchecked Se
     private func scheduleReconnect() {
         guard !stopped, !reconnectPending else { return }
         reconnectPending = true
-        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            guard let self else { return }
-            self.delegateQueue.addOperation { [weak self] in
-                guard let self, !self.stopped else { return }
-                self.reconnectPending = false
-                if self.streamTask == nil {
-                    self.connectStreamNow()
-                }
+        streamQueue.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self, !self.stopped else { return }
+            self.reconnectPending = false
+            if self.connection == nil {
+                self.connectStreamNow()
             }
         }
     }
 
-    func urlSession(
-        _ session: URLSession,
-        dataTask: URLSessionDataTask,
-        didReceive response: URLResponse,
-        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
-    ) {
-        guard dataTask === streamTask, !stopped else {
-            completionHandler(.cancel)
-            return
-        }
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-            completionHandler(.cancel)
-            handleDisconnect()
-            return
-        }
-        if let contentType = http.value(forHTTPHeaderField: "Content-Type"),
-           let parsedBoundary = extractBoundary(from: contentType) {
-            boundary = parsedBoundary
-        }
-        buffer.removeAll(keepingCapacity: true)
-        lastFrameAt = ProcessInfo.processInfo.systemUptime
-        completionHandler(.allow)
-    }
-
-    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        guard dataTask === streamTask, !stopped, !data.isEmpty else { return }
+    private func processIncomingBytes(_ data: Data) {
         buffer.append(data)
         if buffer.count > 32 * 1024 * 1024 {
             handleDisconnect()
             return
+        }
+
+        if !httpHeaderParsed {
+            let limit = buffer.index(buffer.startIndex, offsetBy: min(buffer.count, 8192))
+            guard let headerEnd = buffer.range(of: headerEndMarker, in: buffer.startIndex..<limit) else {
+                if buffer.count >= 8192 {
+                    handleDisconnect()
+                }
+                return
+            }
+            let rawHead = String(data: buffer[buffer.startIndex..<headerEnd.lowerBound], encoding: .utf8) ?? ""
+            let lines = rawHead.components(separatedBy: "\r\n")
+            guard let statusLine = lines.first, statusLine.contains(" 200 ") else {
+                handleDisconnect()
+                return
+            }
+            for line in lines.dropFirst() {
+                let kv = line.split(separator: ":", maxSplits: 1)
+                guard kv.count == 2 else { continue }
+                if kv[0].trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "content-type",
+                   let parsedBoundary = extractBoundary(from: String(kv[1])) {
+                    boundary = parsedBoundary
+                }
+            }
+            buffer.removeSubrange(buffer.startIndex..<headerEnd.upperBound)
+            httpHeaderParsed = true
+            lastFrameAt = ProcessInfo.processInfo.systemUptime
         }
 
         var latestPart: (jpeg: Data, seq: UInt64?, width: Int?, height: Int?, fps: Double?)?
@@ -1345,6 +1392,9 @@ final class RemotePreviewClient: NSObject, URLSessionDataDelegate, @unchecked Se
         let seq = frame.seq ?? renderedFrames
         let w = frame.width ?? cgImage.width
         let h = frame.height ?? cgImage.height
+        if renderedFrames == 1 {
+            log("PREVIEW-CLIENT first-frame seq=\(seq) size=\(w)x\(h) url=\(baseURL)")
+        }
         let effectiveFps = remoteServerFps > 0 ? remoteServerFps : measuredFps
         let devLabel = remoteDeviceName ?? "Remote Capture"
         let statusText = String(
@@ -1357,11 +1407,6 @@ final class RemotePreviewClient: NSObject, URLSessionDataDelegate, @unchecked Se
             baseURL
         )
         onFrame(cgImage, statusText, remoteDeviceName)
-    }
-
-    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        guard task === streamTask, !stopped else { return }
-        handleDisconnect()
     }
 
     private func extractBoundary(from contentType: String) -> String? {
