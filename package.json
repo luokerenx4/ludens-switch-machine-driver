@@ -1,0 +1,37 @@
+{
+  "name": "@ludens-community/driver-switch2",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/luokerenx4/ludens-switch-machine-driver.git"
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "capture:build": "bash scripts/build-capture.sh",
+    "capture:headless": "bash scripts/build-capture.sh && ./native/build/switch2-capture --headless",
+    "capture:preview": "bash scripts/build-capture.sh && ./native/build/switch2-capture --preview",
+    "scripts:check": "bash -n scripts/build-capture.sh"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "ajv": "8.20.0",
+    "ajv-formats": "3.0.1"
+  },
+  "devDependencies": {
+    "@types/bun": "1.3.14",
+    "typescript": "6.0.2"
+  },
+  "description": "Real Nintendo Switch 2 driver for Ludens Baseware (Pi 5 pcble2gamepad bridge + USB HDMI capture)",
+  "files": [
+    "src",
+    "native/Switch2Capture.swift",
+    "scripts",
+    "README.md"
+  ]
+}
