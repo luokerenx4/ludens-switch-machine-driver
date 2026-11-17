@@ -8,8 +8,8 @@ export type { DriverProvider };
 /** Importing the package describes the driver; it never touches hardware. */
 const registration = {
   id: "switch2",
-  version: "0.1.0",
-  fallbackVersion: "0.1.0",
+  version: "0.2.0",
+  fallbackVersion: "0.2.0",
   transport: "bridge" as const,
   defaultPort: 18765,
   needsGame: false,

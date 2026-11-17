@@ -102,6 +102,25 @@ function startMockPi(options: { inputDelayMs?: number; initialState?: "connected
 
 const jpegBytes = new Uint8Array([0xff, 0xd8, 0xff, 0xd9]);
 const pngBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+function wavFixture(durationMs: number): Buffer {
+  const dataBytes = durationMs * 48_000 * 2 * 2 / 1_000;
+  const wav = Buffer.alloc(44 + dataBytes);
+  wav.write("RIFF", 0);
+  wav.writeUInt32LE(36 + dataBytes, 4);
+  wav.write("WAVEfmt ", 8);
+  wav.writeUInt32LE(16, 16);
+  wav.writeUInt16LE(1, 20);
+  wav.writeUInt16LE(2, 22);
+  wav.writeUInt32LE(48_000, 24);
+  wav.writeUInt32LE(48_000 * 2 * 2, 28);
+  wav.writeUInt16LE(2 * 2, 32);
+  wav.writeUInt16LE(16, 34);
+  wav.write("data", 36);
+  wav.writeUInt32LE(dataBytes, 40);
+  for (let index = 44; index < wav.length; index += 1) wav[index] = index % 251;
+  return wav;
+}
 let frameSequence = 0;
 
 function startMockCapture() {
@@ -119,6 +138,12 @@ function startMockCapture() {
           headers: { "Content-Type": png ? "image/png" : "image/jpeg", "X-Frame-Sequence": String(frameSequence), "X-Frame-Width": "1280", "X-Frame-Height": "720" },
         });
       }
+      if (url.pathname === "/audio/capture") {
+        const durationMs = Number(url.searchParams.get("durationMs") ?? "1000");
+        return new Response(new Uint8Array(wavFixture(durationMs)), {
+          headers: { "Content-Type": "audio/wav", "X-Audio-Sequence": "77", "X-Audio-Sample-Rate": "48000", "X-Audio-Channels": "2", "X-Audio-Duration-Ms": String(durationMs) },
+        });
+      }
       return new Response("not found", { status: 404 });
     },
   });
@@ -128,6 +153,7 @@ function startMockCapture() {
 interface PadStateOutput { state: Record<string, number> }
 interface PlayOutput { status: string; spans: number; inputWrites: number }
 interface CaptureOutput { sourceSequence: number; format: string; width: number }
+interface AudioCaptureOutput { sourceSequence: number; durationMs: number; sampleRate: number; channels: number }
 interface InputBody { buttons: number[] }
 
 async function openProvider(piUrl: string, captureUrl: string, keepaliveIntervalMs = 20) {
@@ -255,6 +281,41 @@ describe("provider with mock Pi and capture servers", () => {
     expect(png.result.content[0]).toMatchObject({ type: "image", mimeType: "image/png" });
     expect(png.observations?.[0]?.sourceSequence).toBeGreaterThan(0);
     provider.close(); pi.close(); capture.close();
+  });
+
+  test("audio.capture returns a bounded WAV clip and media observation", async () => {
+    const pi = startMockPi();
+    const capture = startMockCapture();
+    const { provider, find } = await openProvider(pi.url, capture.url);
+    const audio = find("audio.capture");
+    const result = await audio.execute({ durationMs: 250 }, context());
+    const output = result.result.structuredContent as unknown as AudioCaptureOutput;
+    expect(output).toMatchObject({ sourceSequence: 77, durationMs: 250, sampleRate: 48_000, channels: 2 });
+    const block = result.result.content[0];
+    if (block?.type !== "audio") throw new Error("missing audio content block");
+    expect(block.mimeType).toBe("audio/wav");
+    const wav = Buffer.from(block.data, "base64");
+    expect(wav.subarray(0, 4).toString()).toBe("RIFF");
+    expect(wav.subarray(8, 12).toString()).toBe("WAVE");
+    expect(wav.readUInt32LE(24)).toBe(48_000);
+    expect(wav.readUInt16LE(22)).toBe(2);
+    expect(wav.length).toBe(44 + 48_000);
+    expect(wav.subarray(44).equals(wavFixture(250).subarray(44))).toBe(true);
+    expect(result.observations?.[0]).toMatchObject({ controllerId: "audio.capture", mediaType: "audio/wav", sourceSequence: 77, contentIndex: 0 });
+    await expect(audio.execute({ durationMs: 99 }, context())).rejects.toThrow("durationMs");
+    await expect(audio.execute({ durationMs: 10_001 }, context())).rejects.toThrow("durationMs");
+    provider.close(); pi.close(); capture.close();
+  });
+
+  test("audio.capture preserves native permission and device errors", async () => {
+    const pi = startMockPi();
+    const capture = Bun.serve({
+      port: 0,
+      fetch: () => new Response("audio capture permission denied; enable microphone access", { status: 503 }),
+    });
+    const { provider, find } = await openProvider(pi.url, `http://127.0.0.1:${capture.port}`);
+    await expect(find("audio.capture").execute({}, context())).rejects.toThrow("HTTP 503: audio capture permission denied");
+    provider.close(); pi.close(); capture.stop(true);
   });
 
   test("pad.play anchors span deadlines to wall clock even when /input has network latency", async () => {
