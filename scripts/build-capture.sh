@@ -25,6 +25,8 @@ cat > native/build/Info.plist <<'EOF'
 	<true/>
 	<key>NSCameraUsageDescription</key>
 	<string>Capture HDMI video from the connected Switch 2 USB capture card.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Capture HDMI audio from the connected Switch 2 USB capture card.</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 </dict>

@@ -3,7 +3,7 @@
 Real-hardware Nintendo Switch / Switch 2 driver for Ludens Baseware. This standalone package implements the `DriverRegistration` (`id: "switch2"`) and bridges two decoupled local endpoints without any runtime import from the Ludens host repository:
 
 1. **Gamepad Bridge (`:18765`)** — Raspberry Pi 5 running `pcble2gamepad` (Bluetooth Pro Controller emulation), auto-tunneled over SSH (`127.0.0.1:18765 -> 127.0.0.1:8765`) with automatic Bluetooth `waiting` recovery.
-2. **HDMI Capture Service (`:18766`)** — Native macOS Swift helper (`switch2-capture`) driving USB UVC HDMI capture cards (e.g., Hagibis, UGREEN, Elgato, AVerMedia) in a persistent `--headless` daemon, paired with an optional decoupled `--preview` desktop client window that reconnects automatically across capture restarts.
+2. **HDMI Capture Service (`:18766`)** — Native macOS Swift helper (`switch2-capture`) driving USB UVC HDMI capture cards (e.g., Hagibis, UGREEN, Elgato, AVerMedia) and their matching USB audio inputs in a persistent `--headless` daemon, paired with an optional decoupled `--preview` desktop client window that reconnects audio and video automatically across capture restarts.
 
 Importing the package only describes the driver registration; it never touches hardware, opens SSH tunnels, or starts capture processes until `load()` is invoked.
 
@@ -27,8 +27,9 @@ Importing the package only describes the driver registration; it never touches h
                         ┌──────────────────────────────────────────────────────┐
                         │  switch2-capture --headless (127.0.0.1:18766)        │
                         │  GET /status · GET /health · GET /capture · /stream  │
+                        │  GET /audio/stream · GET /audio/capture              │
                         └──────────────────────────▲───────────────────────────┘
-                                                   │ MJPEG /stream (500ms auto-reconnect)
+                                                   │ MJPEG /stream + PCM /audio/stream
                                                    │
                         ┌──────────────────────────┴───────────────────────────┐
                         │  switch2-capture --preview (Desktop Preview Window)  │
@@ -37,7 +38,7 @@ Importing the package only describes the driver registration; it never touches h
 ```
 
 ### Why Dual-Process Capture + Preview?
-- **Lock-screen & Space resilience**: `switch2-capture` holds a persistent `ProcessInfo.beginActivity([.userInitiated, .latencyCritical])` token so macOS App Nap never throttles `AVCaptureSession` when the screen locks or windows are occluded.
+- **Lock-screen & Space resilience**: `switch2-capture` holds a persistent `ProcessInfo.beginActivity([.userInitiated, .latencyCritical, .idleSystemSleepDisabled])` token so macOS App Nap and idle system sleep never throttle or suspend `AVCaptureSession` when the screen locks or windows are occluded. Display sleep remains allowed; a forced sleep or USB disconnect still triggers session recovery.
 - **Zero-downtime UI lifecycle**: Baseware always launches `switch2-capture --headless` (`NSApplication.ActivationPolicy.prohibited`) so background restarts never steal desktop focus, and closing the `--preview` desktop window never terminates the HDMI capture daemon.
 - **Smart attach & exclusive port binding**: `NWListener` binds `:18766` without `allowLocalEndpointReuse`, preventing silent duplicate instances from fighting over the UVC device. Launching `switch2-capture` without flags automatically probes `http://127.0.0.1:18766/status` and attaches in pure `--preview` client mode if a healthy daemon is already running.
 - **Transient capture retry**: `screen.capture` retries transient network errors and `HTTP 502/503/504` responses (up to 2 retries with `250ms` backoff while respecting `AbortSignal`), riding through sub-second capture daemon restarts cleanly.
@@ -91,6 +92,7 @@ bun run capture:preview
 | `--url <url>` | Base URL of the capture daemon for `--preview` mode. | `http://127.0.0.1:<port>` |
 | `--port <port>` | Loopback HTTP port for `--headless` server (or default target port for `--preview`). | `18766` |
 | `--device <name>` | Preferred UVC capture card name, model, or unique ID (`auto` scores external UVC HDMI cards and ignores Continuity/Apple cameras). | `auto` |
+| `--audio-device <name>` | Preferred USB audio input name or unique ID. `auto` only selects the external audio device whose name matches the selected capture card; it never falls back to a host microphone. | `auto` |
 | `--mode <mode>` | Capture resolution and frame rate (`1920x1080@60`, `1080p60`, `1280x720@60`, `720p60`, `2k60`, `4k60`, etc.). | `1280x720@60` |
 | `--help`, `-h` | Print CLI usage and exit. | — |
 
@@ -99,6 +101,8 @@ bun run capture:preview
 - `GET /status` & `GET /health` (also supports `HEAD`): JSON health/telemetry snapshot (`ok`, `connected`, `headless`, `mode`, `device`, `modelID`, `supportedModes`, `width`, `height`, `fps`, `frameSequence`, `capturedAtMs`, `streamClients`, `pid`).
 - `GET /capture?format=jpeg|png&quality=0.2..1.0`: Latest captured frame with `X-Frame-Sequence`, `X-Frame-Width`, and `X-Frame-Height` headers (`503` if no frame is available within 2s).
 - `GET /stream?fps=1..60&quality=0.3..0.95`: `multipart/x-mixed-replace; boundary=frame` live MJPEG stream consumed by `--preview` (shares per-frame JPEG cache across clients and cleans up automatically on disconnect).
+- `GET /audio/stream`: Live 48 kHz stereo signed-16 little-endian PCM (`application/octet-stream`) for preview playback. Audio reconnects independently from video and stops when the preview closes.
+- `GET /audio/capture?durationMs=100..10000`: Most recent exact-duration PCM clip from the bounded 10-second ring, encoded as a 44-byte-header WAV with `X-Audio-Sequence`, `X-Audio-Sample-Rate`, `X-Audio-Channels`, and `X-Audio-Duration-Ms` (`503` until enough audio is available).
 
 ---
 
@@ -113,6 +117,7 @@ bun run capture:preview
 | `LUDENS_SWITCH2_CAPTURE_URL` | Full HTTP base URL override for `switch2-capture` (disables auto-spawn unless `spawnCapture: true`) | `http://127.0.0.1:<capturePort>` |
 | `LUDENS_SWITCH2_CAPTURE_PORT` | Local loopback port for `switch2-capture` | `18766` |
 | `LUDENS_SWITCH2_CAPTURE_DEVICE` | Preferred UVC capture card substring or ID | `auto` |
+| `LUDENS_SWITCH2_AUDIO_DEVICE` | Preferred USB audio input name or unique ID; `auto` matches only the capture card's same-named external audio input | `auto` |
 | `LUDENS_SWITCH2_CAPTURE_MODE` | Preferred capture mode (e.g., `1920x1080@60`) | `1280x720@60` |
 | `LUDENS_SWITCH2_CAPTURE_HEADLESS` | Set to `1` to force `--headless` daemon mode | unset |
 | `LUDENS_SWITCH2_CAPTURE_PREVIEW` | Set to `1` to force `--preview` client window mode | unset |
@@ -127,6 +132,8 @@ bun run capture:preview
   - Automatically restarts `ludens-wireless-controller` if Bluetooth drops back to `waiting` (e.g., during Switch *Change Grip/Order* pairing transitions).
 - `screen.capture`:
   - Captures the latest HDMI frame as `jpeg` (default) or `png` after an optional `delayMs`, returning `sourceSequence`, dimensions, and timing metadata. Does not require pad ownership (`requiresControl: false`).
+- `audio.capture`:
+  - Returns the latest 100 ms–10 s of HDMI audio as a 48 kHz stereo `audio/wav` content block with source sequence, duration, format, and timing metadata. Does not require pad ownership (`requiresControl: false`).
 
 ---
 

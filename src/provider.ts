@@ -255,6 +255,58 @@ export async function createSwitch2Provider(options: Switch2ProviderOptions) {
     },
   };
 
+  const audio: Controller = {
+    tool: {
+      name: "audio.capture",
+      description: "Capture the most recent HDMI audio from the Switch 2 capture card as a 48 kHz stereo WAV clip. The native helper retains a bounded 10-second PCM ring buffer. Does not require pad ownership.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          durationMs: { type: "integer", minimum: 100, maximum: 10_000, default: 1_000 },
+        },
+        additionalProperties: false,
+      },
+      annotations: { readOnlyHint: true },
+    },
+    requiresControl: false,
+    mediaTypes: ["audio/wav"],
+    async execute(args, { signal }) {
+      const durationMs = args.durationMs ?? 1_000;
+      if (typeof durationMs !== "number" || !Number.isInteger(durationMs) || durationMs < 100 || durationMs > 10_000) {
+        throw new Error("durationMs must be an integer from 100 to 10000");
+      }
+      signal.throwIfAborted();
+      const id = crypto.randomUUID();
+      const requestedAtMs = clock.now();
+      const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(CAPTURE_REQUEST_TIMEOUT_MS)]);
+      const response = await fetch(`${captureUrl}/audio/capture?durationMs=${durationMs}`, {
+        signal: requestSignal,
+        proxy: "",
+      } as RequestInit);
+      if (!response.ok) {
+        const detail = (await response.text().catch(() => "")).trim().slice(0, 512);
+        throw new Error(`Capture service returned HTTP ${response.status}${detail ? `: ${detail}` : ""}`);
+      }
+      const bodyBytes = await response.arrayBuffer();
+      const sequence = Number(response.headers.get("X-Audio-Sequence"));
+      const sampleRate = Number(response.headers.get("X-Audio-Sample-Rate"));
+      const channels = Number(response.headers.get("X-Audio-Channels"));
+      const returnedDurationMs = Number(response.headers.get("X-Audio-Duration-Ms"));
+      if (!Number.isInteger(sequence) || sequence <= 0 || sampleRate !== 48_000 || channels !== 2 || returnedDurationMs !== durationMs) {
+        throw new Error("Capture service returned invalid audio metadata");
+      }
+      const data = Buffer.from(bodyBytes).toString("base64");
+      const mimeType = "audio/wav";
+      const timing = { clock: clock.id, requestedAtMs, receivedAtMs: clock.now() };
+      const output = { source: "audio", sourceSequence: sequence, durationMs: returnedDurationMs,
+        sampleRate, channels, format: "wav", timing };
+      const result = structuredResult(output);
+      result.content.unshift({ type: "audio", mimeType, data });
+      return { ...toolExecution(clock, requestedAtMs, result), timing,
+        observations: [{ id, controllerId: "audio.capture", mediaType: mimeType, timing, sourceSequence: sequence, contentIndex: 0 }] };
+    },
+  };
+
   const pads: Controller[] = padTools(BUTTONS, AXES, POLLED_TIMING).map(tool => ({
     tool, requiresControl: true, acquire, release,
     async execute(args, context) {
@@ -283,7 +335,7 @@ export async function createSwitch2Provider(options: Switch2ProviderOptions) {
   }));
 
   return {
-    capabilities: { controllers: [...pads, screen] } satisfies Capabilities,
+    capabilities: { controllers: [...pads, screen, audio] } satisfies Capabilities,
     onDisconnect(_handler: (error: Error) => void) { /* HTTP polling bridge has no disconnect event */ },
     close() {
       captureProcess?.kill("SIGTERM");

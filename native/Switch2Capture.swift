@@ -115,6 +115,36 @@ func pickCaptureDevice(preferredName: String?) -> AVCaptureDevice? {
     return candidates.max(by: { scoreCaptureDevice($0) < scoreCaptureDevice($1) })
 }
 
+func isBuiltinOrContinuityAudio(_ device: AVCaptureDevice) -> Bool {
+    let model = device.modelID.lowercased()
+    let uid = device.uniqueID.lowercased()
+    if model.hasPrefix("iphone") || model.hasPrefix("ipad") { return true }
+    if uid.contains("continuity") || uid.hasPrefix("applecamera") || uid.hasPrefix("builtinmicrophone") { return true }
+    return false
+}
+
+func pickAudioDevice(preferredName: String?, videoCardName: String?) -> AVCaptureDevice? {
+    let devices = AVCaptureDevice.DiscoverySession(
+        deviceTypes: [.external, .microphone],
+        mediaType: .audio,
+        position: .unspecified
+    ).devices.filter { !isBuiltinOrContinuityAudio($0) }
+    if let query = preferredName?.trimmingCharacters(in: .whitespacesAndNewlines),
+       !query.isEmpty, query.lowercased() != "auto" {
+        if let exact = devices.first(where: { $0.localizedName == query || $0.uniqueID == query }) {
+            return exact
+        }
+        let lower = query.lowercased()
+        return devices.first(where: {
+            $0.localizedName.lowercased().contains(lower) ||
+            $0.uniqueID.lowercased().contains(lower)
+        })
+    }
+    // Auto: only an external audio device whose localizedName exactly matches the selected video card.
+    guard let card = videoCardName?.trimmingCharacters(in: .whitespacesAndNewlines), !card.isEmpty else { return nil }
+    return devices.first { $0.localizedName == card }
+}
+
 func formatScore(_ format: AVCaptureDevice.Format) -> Int {
     let subType = CMFormatDescriptionGetMediaSubType(format.formatDescription)
     let exts = CMFormatDescriptionGetExtensions(format.formatDescription) as? [String: Any]
@@ -204,6 +234,7 @@ func printUsage() {
     Options:
       --port <port>       HTTP listen/connect port (default: 18766, env: LUDENS_SWITCH2_CAPTURE_PORT)
       --device <query>    Preferred USB capture device name/ID (env: LUDENS_SWITCH2_CAPTURE_DEVICE)
+      --audio-device <q>  Preferred USB audio device name/ID (env: LUDENS_SWITCH2_AUDIO_DEVICE)
       --mode <WxH@fps>    Capture mode, e.g. 1920x1080@60 or 1080p60 (env: LUDENS_SWITCH2_CAPTURE_MODE)
       --headless          Run as pure headless capture HTTP service (env: LUDENS_SWITCH2_CAPTURE_HEADLESS=1)
       --preview           Run as pure decoupled preview window client (env: LUDENS_SWITCH2_CAPTURE_PREVIEW=1)
@@ -216,6 +247,7 @@ func printUsage() {
 var arguments = CommandLine.arguments.dropFirst()
 var httpPort: UInt16 = UInt16(env("LUDENS_SWITCH2_CAPTURE_PORT") ?? "") ?? 18766
 var requestedDeviceName: String? = env("LUDENS_SWITCH2_CAPTURE_DEVICE")
+var requestedAudioDeviceName: String? = env("LUDENS_SWITCH2_AUDIO_DEVICE")
 var explicitModeRaw: String? = env("LUDENS_SWITCH2_CAPTURE_MODE")
 var headless = envBool("LUDENS_SWITCH2_CAPTURE_HEADLESS")
 var previewExplicit = envBool("LUDENS_SWITCH2_CAPTURE_PREVIEW")
@@ -237,6 +269,8 @@ while let flag = arguments.popFirst() {
         }
     case "--device":
         requestedDeviceName = arguments.popFirst() ?? requestedDeviceName
+    case "--audio-device":
+        requestedAudioDeviceName = arguments.popFirst() ?? requestedAudioDeviceName
     case "--mode":
         explicitModeRaw = arguments.popFirst() ?? explicitModeRaw
     case "--headless":
@@ -408,7 +442,7 @@ func isLoopbackPortOccupied(_ port: UInt16) -> Bool {
 
 // Persistent process-level activity assertion so macOS App Nap / screen lock / occlusion never throttles capture or preview.
 let globalActivityToken: NSObjectProtocol = ProcessInfo.processInfo.beginActivity(
-    options: [.userInitiated, .latencyCritical],
+    options: [.userInitiated, .latencyCritical, .idleSystemSleepDisabled],
     reason: "Live Switch 2 HDMI capture and preview"
 )
 
@@ -666,6 +700,229 @@ final class FrameStore: @unchecked Sendable {
     }
 }
 
+let canonicalAudioSampleRate = 48000
+let canonicalAudioChannels = 2
+let canonicalAudioFormat = AVAudioFormat(
+    commonFormat: .pcmFormatInt16,
+    sampleRate: Double(canonicalAudioSampleRate),
+    channels: AVAudioChannelCount(canonicalAudioChannels),
+    interleaved: true
+)!
+let audioBytesPerMillisecond = canonicalAudioSampleRate * canonicalAudioChannels * 2 / 1000 // 192 bytes/ms s16le stereo
+
+func wavHeaderData(dataBytes: Int, sampleRate: Int, channels: Int, bitsPerSample: Int = 16) -> Data {
+    var data = Data(capacity: 44)
+    let blockAlign = channels * bitsPerSample / 8
+    let byteRate = sampleRate * blockAlign
+
+    func appendASCII(_ text: String) {
+        data.append(contentsOf: text.utf8)
+    }
+    func appendLE16(_ value: UInt16) {
+        withUnsafeBytes(of: value.littleEndian) { data.append(contentsOf: $0) }
+    }
+    func appendLE32(_ value: UInt32) {
+        withUnsafeBytes(of: value.littleEndian) { data.append(contentsOf: $0) }
+    }
+
+    appendASCII("RIFF")
+    appendLE32(UInt32(36 + dataBytes))
+    appendASCII("WAVE")
+    appendASCII("fmt ")
+    appendLE32(16) // PCM fmt chunk size
+    appendLE16(1) // WAVE_FORMAT_PCM
+    appendLE16(UInt16(channels))
+    appendLE32(UInt32(sampleRate))
+    appendLE32(UInt32(byteRate))
+    appendLE16(UInt16(blockAlign))
+    appendLE16(UInt16(bitsPerSample))
+    appendASCII("data")
+    appendLE32(UInt32(dataBytes))
+    return data
+}
+
+struct AudioChunk {
+    let sequence: UInt64
+    let capturedAtMs: Double
+    let data: Data
+}
+
+struct AudioStatusSnapshot: Sendable {
+    let connected: Bool
+    let deviceName: String?
+    let sampleRate: Int
+    let channels: Int
+    let sequence: UInt64
+    let capturedAtMs: Double
+    let streamClients: Int
+}
+
+// Lock-protected bounded ring of canonical interleaved s16le stereo PCM chunks.
+// Retains 10 seconds (1,920,000 bytes) max; sequence is monotonic for the process
+// lifetime so stream clients can distinguish fresh data across reconnects.
+final class AudioStore: @unchecked Sendable {
+    static let maxBytes = 1_920_000
+    private let lock = NSLock()
+    private var chunks: [AudioChunk] = []
+    private var totalBytes = 0
+    private var connected = false
+    private var deviceName: String?
+    private var sampleRate = canonicalAudioSampleRate
+    private var channels = canonicalAudioChannels
+    private(set) var sequence: UInt64 = 0
+    private(set) var capturedAtMs: Double = 0
+    private var activeStreamClients = 0
+    private var unavailableReason: String?
+
+    func setConnected(device: AVCaptureDevice) {
+        lock.lock()
+        defer { lock.unlock() }
+        connected = true
+        deviceName = device.localizedName
+        unavailableReason = nil
+    }
+
+    func setUnavailable(reason: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        connected = false
+        deviceName = nil
+        unavailableReason = reason
+    }
+
+    func clear() {
+        lock.lock()
+        defer { lock.unlock() }
+        chunks.removeAll(keepingCapacity: false)
+        totalBytes = 0
+        capturedAtMs = 0
+    }
+
+    func isAvailable() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return connected
+    }
+
+    func unavailableMessage() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        return unavailableReason ?? "audio capture unavailable"
+    }
+
+    func latestSequence() -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return sequence
+    }
+
+    func adjustStreamClients(delta: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        activeStreamClients = max(0, activeStreamClients + delta)
+    }
+
+    func statusSnapshot() -> AudioStatusSnapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        return AudioStatusSnapshot(
+            connected: connected,
+            deviceName: deviceName,
+            sampleRate: sampleRate,
+            channels: channels,
+            sequence: sequence,
+            capturedAtMs: capturedAtMs,
+            streamClients: activeStreamClients
+        )
+    }
+
+    func append(bytes: UnsafeRawPointer, byteCount: Int) {
+        guard byteCount > 0 else { return }
+        let chunkData = Data(bytes: bytes, count: byteCount)
+        lock.lock()
+        defer { lock.unlock() }
+        sequence &+= 1
+        capturedAtMs = Date().timeIntervalSince1970 * 1000
+        chunks.append(AudioChunk(sequence: sequence, capturedAtMs: capturedAtMs, data: chunkData))
+        totalBytes += byteCount
+        while totalBytes > Self.maxBytes, let oldest = chunks.first {
+            let excess = totalBytes - Self.maxBytes
+            if oldest.data.count <= excess {
+                totalBytes -= oldest.data.count
+                chunks.removeFirst()
+            } else {
+                chunks[0] = AudioChunk(sequence: oldest.sequence, capturedAtMs: oldest.capturedAtMs,
+                    data: oldest.data.dropFirst(excess))
+                totalBytes = Self.maxBytes
+            }
+        }
+    }
+
+    /// Newest contiguous PCM after `afterSequence`, bounded by `maxBytes`.
+    /// Falls back to the oldest retained bytes when a slow reader fell behind the
+    /// trimmed ring, so latency never grows unbounded.
+    func chunksAfter(_ afterSequence: UInt64, maxBytes: Int) -> (data: Data, lastSequence: UInt64)? {
+        lock.lock()
+        guard connected, let newest = chunks.last, newest.sequence > afterSequence else {
+            lock.unlock()
+            return nil
+        }
+        var parts: [Data] = []
+        var budget = maxBytes
+        for chunk in chunks.reversed() {
+            if chunk.sequence <= afterSequence { break }
+            if chunk.data.count >= budget {
+                if budget > 0 {
+                    parts.append(chunk.data.suffix(budget))
+                    budget = 0
+                }
+                break
+            }
+            parts.append(chunk.data)
+            budget -= chunk.data.count
+        }
+        lock.unlock()
+        guard !parts.isEmpty else { return nil }
+        var out = Data(capacity: maxBytes - max(budget, 0))
+        for part in parts.reversed() {
+            out.append(part)
+        }
+        return (out, newest.sequence)
+    }
+
+    /// Most recent exact `durationMs` of PCM, or nil when unavailable/insufficient.
+    func latestCaptureBytes(durationMs: Int) -> (data: Data, sequence: UInt64, capturedAtMs: Double)? {
+        let needed = durationMs * audioBytesPerMillisecond
+        lock.lock()
+        guard connected, totalBytes >= needed else {
+            lock.unlock()
+            return nil
+        }
+        var parts: [Data] = []
+        var remaining = needed
+        var newestAtMs: Double = 0
+        for chunk in chunks.reversed() {
+            if remaining == 0 { break }
+            let take = min(chunk.data.count, remaining)
+            if take == chunk.data.count {
+                parts.append(chunk.data)
+            } else {
+                parts.append(chunk.data.suffix(take))
+            }
+            if newestAtMs == 0 { newestAtMs = chunk.capturedAtMs }
+            remaining -= take
+        }
+        let newestSeq = sequence
+        lock.unlock()
+        guard remaining == 0, !parts.isEmpty else { return nil }
+        var out = Data(capacity: needed)
+        for part in parts.reversed() {
+            out.append(part)
+        }
+        return (out, newestSeq, newestAtMs)
+    }
+}
+
 func parseQueryParams(_ rawQuery: String?) -> [String: String] {
     guard let rawQuery, !rawQuery.isEmpty else { return [:] }
     var out: [String: String] = [:]
@@ -841,6 +1098,159 @@ final class MjpegStreamSession: @unchecked Sendable {
     }
 }
 
+// One /audio/stream client: raw canonical PCM after a 200 header, no Content-Length.
+final class AudioStreamSession: @unchecked Sendable {
+    private let connection: NWConnection
+    private weak var server: HttpServer?
+    private let lock = NSLock()
+    private var closed = false
+    private var lastSentSequence: UInt64
+    private var lastSendAt: TimeInterval
+    private var sendWatchdog: DispatchSourceTimer?
+
+    init(connection: NWConnection, server: HttpServer, startSequence: UInt64) {
+        self.connection = connection
+        self.server = server
+        self.lastSentSequence = startSequence
+        self.lastSendAt = ProcessInfo.processInfo.systemUptime
+    }
+
+    var isClosed: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return closed
+    }
+
+    func start() {
+        guard let server else {
+            connection.cancel()
+            return
+        }
+        server.audioStore.adjustStreamClients(delta: 1)
+
+        connection.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .failed, .cancelled:
+                self?.close()
+            default:
+                break
+            }
+        }
+        watchClientEOF()
+
+        let watchdog = DispatchSource.makeTimerSource(queue: server.streamQueue)
+        watchdog.schedule(deadline: .now() + 1.0, repeating: 1.0)
+        watchdog.setEventHandler { [weak self] in
+            guard let self, !self.isClosed else { return }
+            self.lock.lock()
+            let lastSendAt = self.lastSendAt
+            self.lock.unlock()
+            if ProcessInfo.processInfo.systemUptime - lastSendAt > 3.0 {
+                self.close()
+            }
+        }
+        watchdog.resume()
+        sendWatchdog = watchdog
+
+        let head = "HTTP/1.1 200 OK\r\n" +
+            "Content-Type: application/octet-stream\r\n" +
+            "X-Audio-Sample-Rate: \(canonicalAudioSampleRate)\r\n" +
+            "X-Audio-Channels: \(canonicalAudioChannels)\r\n" +
+            "X-Audio-Format: s16le\r\n" +
+            "Cache-Control: no-store\r\n" +
+            "Connection: close\r\n\r\n"
+        connection.send(content: Data(head.utf8), completion: .contentProcessed { [weak self] sendError in
+            guard let self else { return }
+            if sendError != nil {
+                self.close()
+                return
+            }
+            self.schedulePump(after: 0)
+        })
+    }
+
+    func close() {
+        lock.lock()
+        if closed {
+            lock.unlock()
+            return
+        }
+        closed = true
+        lock.unlock()
+
+        sendWatchdog?.cancel()
+        sendWatchdog = nil
+        server?.audioStore.adjustStreamClients(delta: -1)
+        server?.unregisterAudioStream(self)
+        connection.stateUpdateHandler = nil
+        connection.cancel()
+    }
+
+    private func watchClientEOF() {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 4096) { [weak self] _, _, isComplete, error in
+            guard let self else { return }
+            if error != nil || isComplete {
+                self.close()
+                return
+            }
+            if !self.isClosed {
+                self.watchClientEOF()
+            }
+        }
+    }
+
+    private func schedulePump(after delay: TimeInterval) {
+        guard let server, !isClosed else {
+            close()
+            return
+        }
+        if delay <= 0 {
+            server.streamQueue.async { [weak self] in
+                self?.pump()
+            }
+        } else {
+            server.streamQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.pump()
+            }
+        }
+    }
+
+    private func pump() {
+        guard let server, !isClosed else {
+            close()
+            return
+        }
+        let store = server.audioStore
+        guard store.isAvailable() else {
+            close()
+            return
+        }
+        // At most 0.5 s of PCM in flight; the ring trims behind a slow reader,
+        // so backpressure skips stale audio instead of growing latency.
+        guard let next = store.chunksAfter(lastSentSequence, maxBytes: audioBytesPerMillisecond * 500) else {
+            if ProcessInfo.processInfo.systemUptime - lastSendAt > 3.0 {
+                close()
+                return
+            }
+            schedulePump(after: 0.005)
+            return
+        }
+        lock.lock()
+        lastSentSequence = next.lastSequence
+        lastSendAt = ProcessInfo.processInfo.systemUptime
+        lock.unlock()
+
+        connection.send(content: next.data, completion: .contentProcessed { [weak self] sendError in
+            guard let self else { return }
+            if sendError != nil || self.isClosed {
+                self.close()
+                return
+            }
+            self.schedulePump(after: 0)
+        })
+    }
+}
+
 final class StartupStateBox: @unchecked Sendable {
     private let lock = NSLock()
     private var resolved = false
@@ -870,6 +1280,7 @@ final class HttpServer: NSObject, @unchecked Sendable {
     let port: UInt16
     let listener: NWListener
     let store: FrameStore
+    let audioStore: AudioStore
     let fallbackModeProvider: @Sendable () -> Mode
     let context = CIContext(options: [
         .cacheIntermediates: false,
@@ -879,10 +1290,13 @@ final class HttpServer: NSObject, @unchecked Sendable {
     let streamQueue = DispatchQueue(label: "switch2.http.stream", qos: .userInteractive)
     private let activeStreamsLock = NSLock()
     private var activeStreams: [ObjectIdentifier: MjpegStreamSession] = [:]
+    private let activeAudioStreamsLock = NSLock()
+    private var activeAudioStreams: [ObjectIdentifier: AudioStreamSession] = [:]
 
-    init(port: UInt16, store: FrameStore, fallbackModeProvider: @escaping @Sendable () -> Mode) throws {
+    init(port: UInt16, store: FrameStore, audioStore: AudioStore, fallbackModeProvider: @escaping @Sendable () -> Mode) throws {
         self.port = port
         self.store = store
+        self.audioStore = audioStore
         self.fallbackModeProvider = fallbackModeProvider
         guard let nwPort = NWEndpoint.Port(rawValue: port) else {
             throw NSError(domain: "Switch2Capture", code: 2, userInfo: [
@@ -965,12 +1379,25 @@ final class HttpServer: NSObject, @unchecked Sendable {
         for s in sessions {
             s.close()
         }
+        activeAudioStreamsLock.lock()
+        let audioSessions = Array(activeAudioStreams.values)
+        activeAudioStreams.removeAll()
+        activeAudioStreamsLock.unlock()
+        for s in audioSessions {
+            s.close()
+        }
     }
 
     fileprivate func unregisterStream(_ session: MjpegStreamSession) {
         activeStreamsLock.lock()
         activeStreams.removeValue(forKey: ObjectIdentifier(session))
         activeStreamsLock.unlock()
+    }
+
+    fileprivate func unregisterAudioStream(_ session: AudioStreamSession) {
+        activeAudioStreamsLock.lock()
+        activeAudioStreams.removeValue(forKey: ObjectIdentifier(session))
+        activeAudioStreamsLock.unlock()
     }
 
     private func accept(_ connection: NWConnection) {
@@ -1036,6 +1463,16 @@ final class HttpServer: NSObject, @unchecked Sendable {
         ]
         if let modelID = state.modelID { object["modelID"] = modelID }
         if !state.supportedModes.isEmpty { object["supportedModes"] = state.supportedModes.map(\.id) }
+        let audio = audioStore.statusSnapshot()
+        object["audio"] = [
+            "connected": audio.connected,
+            "device": audio.deviceName ?? NSNull(),
+            "sampleRate": audio.sampleRate,
+            "channels": audio.channels,
+            "sequence": audio.sequence,
+            "capturedAtMs": (audio.capturedAtMs * 10).rounded() / 10,
+            "streamClients": audio.streamClients,
+        ]
         return (try? JSONSerialization.data(withJSONObject: object)) ?? Data("{}".utf8)
     }
 
@@ -1103,6 +1540,56 @@ final class HttpServer: NSObject, @unchecked Sendable {
             return
         }
 
+        if routePath == "/audio/stream" {
+            let audioHeaders = [
+                ("X-Audio-Sample-Rate", String(canonicalAudioSampleRate)),
+                ("X-Audio-Channels", String(canonicalAudioChannels)),
+                ("X-Audio-Format", "s16le"),
+            ]
+            if isHead {
+                respond(connection, status: "200 OK", contentType: "application/octet-stream", headers: audioHeaders, body: Data(), headOnly: true)
+                return
+            }
+            startAudioStream(connection)
+            return
+        }
+
+        if routePath == "/audio/capture" {
+            if isHead {
+                respond(connection, status: "200 OK", contentType: "audio/wav", headers: [], body: Data(), headOnly: true)
+                return
+            }
+            var durationMs = 1000
+            if let raw = query["durationms"], !raw.isEmpty {
+                guard let parsed = Int(raw.trimmingCharacters(in: .whitespaces)),
+                      (100...10000).contains(parsed) else {
+                    respond(connection, status: "400 Bad Request", contentType: "text/plain", headers: [], body: Data("invalid durationMs: expected integer 100..10000".utf8), headOnly: false)
+                    return
+                }
+                durationMs = parsed
+            }
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                guard let self else { connection.cancel(); return }
+                guard let captured = self.audioStore.latestCaptureBytes(durationMs: durationMs) else {
+                    let message = self.audioStore.isAvailable()
+                        ? "insufficient audio captured for \(durationMs) ms"
+                        : self.audioStore.unavailableMessage()
+                    self.respond(connection, status: "503 Service Unavailable", contentType: "text/plain", headers: [], body: Data(message.utf8), headOnly: false)
+                    return
+                }
+                var wav = wavHeaderData(dataBytes: captured.data.count, sampleRate: canonicalAudioSampleRate, channels: canonicalAudioChannels, bitsPerSample: 16)
+                wav.append(captured.data)
+                let headers = [
+                    ("X-Audio-Sequence", String(captured.sequence)),
+                    ("X-Audio-Sample-Rate", String(canonicalAudioSampleRate)),
+                    ("X-Audio-Channels", String(canonicalAudioChannels)),
+                    ("X-Audio-Duration-Ms", String(durationMs)),
+                ]
+                self.respond(connection, status: "200 OK", contentType: "audio/wav", headers: headers, body: wav, headOnly: false)
+            }
+            return
+        }
+
         respond(connection, status: "404 Not Found", contentType: "text/plain", headers: [], body: Data("unknown route".utf8), headOnly: isHead)
     }
 
@@ -1118,6 +1605,22 @@ final class HttpServer: NSObject, @unchecked Sendable {
             self.activeStreams[ObjectIdentifier(streamSession)] = streamSession
             self.activeStreamsLock.unlock()
             streamSession.start()
+        }
+    }
+
+    private func startAudioStream(_ connection: NWConnection) {
+        DispatchQueue.global(qos: .userInteractive).async { [weak self] in
+            guard let self else { connection.cancel(); return }
+            guard self.audioStore.isAvailable() else {
+                self.respond(connection, status: "503 Service Unavailable", contentType: "text/plain", headers: [], body: Data(self.audioStore.unavailableMessage().utf8))
+                return
+            }
+            // Only PCM appended after this point is streamed: never replay the ring history.
+            let audioSession = AudioStreamSession(connection: connection, server: self, startSequence: self.audioStore.latestSequence())
+            self.activeAudioStreamsLock.lock()
+            self.activeAudioStreams[ObjectIdentifier(audioSession)] = audioSession
+            self.activeAudioStreamsLock.unlock()
+            audioSession.start()
         }
     }
 }
@@ -1506,6 +2009,280 @@ final class RemotePreviewClient: @unchecked Sendable {
     }
 }
 
+// Playback engine for preview audio: canonical s16le 48k stereo scheduled into an
+// AVAudioPlayerNode. Queued playback is capped so a slow source can never build
+// runaway playback latency; stale audio is flushed on reconnect.
+final class PreviewAudioPlayer: @unchecked Sendable {
+    static let maxQueuedSeconds = 0.5
+    let engine = AVAudioEngine()
+    let player = AVAudioPlayerNode()
+    private let lock = NSLock()
+    private var queuedFrames: Int64 = 0
+    private var playbackGeneration: UInt64 = 0
+    private var engineRunning = false
+    private var muted = false
+
+    func setup() -> Bool {
+        engine.attach(player)
+        engine.connect(player, to: engine.mainMixerNode, format: canonicalAudioFormat)
+        do {
+            try engine.start()
+            engineRunning = true
+        } catch {
+            logError("AUDIO-PREVIEW engine failed to start: \(error.localizedDescription)")
+            return false
+        }
+        player.volume = muted ? 0 : 1
+        player.play()
+        return true
+    }
+
+    func enqueue(_ data: Data) {
+        guard engineRunning else { return }
+        let frameBytes = canonicalAudioChannels * 2
+        let incomingFrames = data.count / frameBytes
+        guard incomingFrames > 0 else { return }
+        lock.lock()
+        let availableFrames = max(0, Int(Self.maxQueuedSeconds * Double(canonicalAudioSampleRate)) - Int(queuedFrames))
+        let frames = min(incomingFrames, availableFrames)
+        guard frames > 0 else {
+            lock.unlock()
+            return
+        }
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: canonicalAudioFormat, frameCapacity: AVAudioFrameCount(frames)) else {
+            lock.unlock()
+            return
+        }
+        buffer.frameLength = AVAudioFrameCount(frames)
+        let byteCount = frames * frameBytes
+        if let dst = buffer.int16ChannelData {
+            data.withUnsafeBytes { raw in
+                guard let base = raw.baseAddress else { return }
+                // Keep the newest samples when a receive exceeds available headroom.
+                memcpy(dst[0], base.advanced(by: data.count - byteCount), byteCount)
+            }
+        }
+        queuedFrames += Int64(frames)
+        let generation = playbackGeneration
+        lock.unlock()
+        player.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { [weak self] _ in
+            guard let self else { return }
+            self.lock.lock()
+            if self.playbackGeneration == generation {
+                self.queuedFrames = max(0, self.queuedFrames - Int64(frames))
+            }
+            self.lock.unlock()
+        }
+    }
+
+    func resetQueue() {
+        lock.lock()
+        playbackGeneration &+= 1
+        queuedFrames = 0
+        lock.unlock()
+        player.stop() // flushes scheduled buffers
+        player.play()
+    }
+
+    func setMuted(_ newMuted: Bool) {
+        lock.lock()
+        muted = newMuted
+        let volume: Float = newMuted ? 0 : 1
+        lock.unlock()
+        player.volume = volume
+    }
+
+    func shutdown() {
+        lock.lock()
+        engineRunning = false
+        lock.unlock()
+        player.stop()
+        engine.stop()
+    }
+}
+
+// Independent reconnecting /audio/stream client for the preview window.
+// Runs beside RemotePreviewClient and never touches video state.
+final class RemoteAudioClient: @unchecked Sendable {
+    let baseURL: String
+    let player: PreviewAudioPlayer
+
+    private let audioQueue = DispatchQueue(label: "switch2.preview.audio", qos: .userInteractive)
+    private var connection: NWConnection?
+    private var watchdog: DispatchSourceTimer?
+    private var stopped = false
+    private var reconnectPending = false
+    private var headerParsed = false
+    private var pending = Data()
+    private var lastDataAt: TimeInterval = 0
+    private var connectStartedAt: TimeInterval = 0
+    private var loggedFirstByte = false
+
+    private let headerEndMarker = Data("\r\n\r\n".utf8)
+
+    init(baseURL: String, player: PreviewAudioPlayer) {
+        self.baseURL = baseURL
+        self.player = player
+    }
+
+    func start() {
+        audioQueue.async { [weak self] in
+            guard let self, !self.stopped else { return }
+            self.startWatchdog()
+            self.connectStreamNow()
+        }
+    }
+
+    func stop() {
+        audioQueue.async { [weak self] in
+            guard let self, !self.stopped else { return }
+            self.stopped = true
+            self.watchdog?.cancel()
+            self.watchdog = nil
+            self.teardownConnection()
+            self.player.shutdown()
+        }
+    }
+
+    private func teardownConnection() {
+        connection?.stateUpdateHandler = nil
+        connection?.cancel()
+        connection = nil
+        headerParsed = false
+        pending.removeAll(keepingCapacity: false)
+    }
+
+    private func startWatchdog() {
+        let timer = DispatchSource.makeTimerSource(queue: audioQueue)
+        timer.schedule(deadline: .now() + 1.0, repeating: 0.5)
+        timer.setEventHandler { [weak self] in
+            guard let self, !self.stopped else { return }
+            let now = ProcessInfo.processInfo.systemUptime
+            guard self.connection != nil, self.connectStartedAt > 0 else { return }
+            if self.headerParsed && self.lastDataAt > 0 && (now - self.lastDataAt) > 3.0 {
+                self.handleDisconnect()
+            } else if !self.headerParsed && (now - self.connectStartedAt) > 3.0 {
+                self.handleDisconnect()
+            }
+        }
+        timer.resume()
+        self.watchdog = timer
+    }
+
+    private func connectStreamNow() {
+        guard !stopped else { return }
+        reconnectPending = false
+        // Flush stale audio from any previous connection before new PCM arrives.
+        player.resetQueue()
+        teardownConnection()
+
+        guard let parsed = URL(string: baseURL),
+              let host = parsed.host, !host.isEmpty else {
+            scheduleReconnect()
+            return
+        }
+        let portNum = UInt16(clamping: parsed.port ?? (parsed.scheme == "https" ? 443 : 80))
+        guard let nwPort = NWEndpoint.Port(rawValue: portNum) else {
+            scheduleReconnect()
+            return
+        }
+
+        connectStartedAt = ProcessInfo.processInfo.systemUptime
+        let conn = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: .tcp)
+        self.connection = conn
+        conn.stateUpdateHandler = { [weak self, weak conn] state in
+            guard let self, let conn, conn === self.connection, !self.stopped else { return }
+            switch state {
+            case .ready:
+                let req = "GET /audio/stream HTTP/1.1\r\nHost: \(host):\(portNum)\r\nAccept: application/octet-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"
+                conn.send(content: Data(req.utf8), completion: .contentProcessed { [weak self, weak conn] err in
+                    guard let self, let conn, conn === self.connection, !self.stopped else { return }
+                    if err != nil {
+                        self.handleDisconnect()
+                        return
+                    }
+                    self.receiveNextChunk(from: conn)
+                })
+            case .failed, .cancelled:
+                self.handleDisconnect()
+            default:
+                break
+            }
+        }
+        conn.start(queue: audioQueue)
+    }
+
+    private func receiveNextChunk(from conn: NWConnection) {
+        conn.receive(minimumIncompleteLength: 1, maximumLength: 262_144) { [weak self, weak conn] data, _, isComplete, error in
+            guard let self, let conn, conn === self.connection, !self.stopped else { return }
+            if let data, !data.isEmpty {
+                self.processAudioBytes(data)
+                if conn !== self.connection { return }
+            }
+            if error != nil || isComplete {
+                self.handleDisconnect()
+                return
+            }
+            self.receiveNextChunk(from: conn)
+        }
+    }
+
+    private func processAudioBytes(_ data: Data) {
+        lastDataAt = ProcessInfo.processInfo.systemUptime
+        if !headerParsed {
+            pending.append(data)
+            guard let headerEnd = pending.range(of: headerEndMarker) else {
+                if pending.count > 16384 {
+                    handleDisconnect()
+                }
+                return
+            }
+            let head = String(data: pending.subdata(in: 0..<headerEnd.lowerBound), encoding: .utf8) ?? ""
+            guard head.contains(" 200 ") else {
+                log("AUDIO-PREVIEW stream rejected: \(head.components(separatedBy: "\r\n").first ?? "unknown response")")
+                handleDisconnect()
+                return
+            }
+            pending = pending.subdata(in: headerEnd.upperBound..<pending.count)
+            headerParsed = true
+        } else {
+            pending.append(data)
+        }
+        if !loggedFirstByte {
+            loggedFirstByte = true
+            log("AUDIO-PREVIEW streaming s16le audio from \(baseURL)/audio/stream")
+        }
+
+        let frameBytes = canonicalAudioChannels * 2
+        let usable = pending.count - (pending.count % frameBytes)
+        guard usable > 0 else { return }
+        let chunk = pending.subdata(in: 0..<usable)
+        pending.removeSubrange(0..<usable)
+        player.enqueue(chunk)
+    }
+
+    private func handleDisconnect() {
+        guard !stopped else { return }
+        player.resetQueue()
+        teardownConnection()
+        lastDataAt = 0
+        connectStartedAt = 0
+        scheduleReconnect()
+    }
+
+    private func scheduleReconnect() {
+        guard !stopped, !reconnectPending else { return }
+        reconnectPending = true
+        audioQueue.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self, !self.stopped else { return }
+            self.reconnectPending = false
+            if self.connection == nil {
+                self.connectStreamNow()
+            }
+        }
+    }
+}
+
 final class ModeBox: @unchecked Sendable {
     private let lock = NSLock()
     private var current: Mode
@@ -1522,23 +2299,37 @@ final class ModeBox: @unchecked Sendable {
     }
 }
 
-final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCaptureVideoDataOutputSampleBufferDelegate, @unchecked Sendable {
+final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate, @unchecked Sendable {
     let activityToken: NSObjectProtocol = globalActivityToken
     let session = AVCaptureSession()
+    let audioSession = AVCaptureSession()
     let captureQueue = DispatchQueue(label: "switch2.capture.session")
     let sampleQueue = DispatchQueue(label: "switch2.capture.frames", qos: .userInteractive)
+    let audioQueue = DispatchQueue(label: "switch2.capture.audio", qos: .userInitiated)
     let output = AVCaptureVideoDataOutput()
+    let audioOutput = AVCaptureAudioDataOutput()
     let store: FrameStore
+    let audioStore: AudioStore
     let modeBox: ModeBox
     var server: HttpServer?
     var previewClient: RemotePreviewClient?
+    var audioPlayer: PreviewAudioPlayer?
+    var audioClient: RemoteAudioClient?
+    var audioMuted = false
+    var audioMuteButton: NSButton?
     var recoveryTimer: DispatchSourceTimer?
     var window: NSWindow?
     var videoView: VideoView?
     var selector: NSPopUpButton?
     var availableModes: [Mode] = presetModes
     var device: AVCaptureDevice?
+    var audioDevice: AVCaptureDevice?
     var currentInput: AVCaptureDeviceInput?
+    var currentAudioInput: AVCaptureDeviceInput?
+    private var audioConverter: AVAudioConverter?
+    private var audioConverterInputKey = ""
+    private var audioCallbackCount = 0
+    private var audioPermissionRequestInFlight = false
     var holdsDeviceLock = false
     var mode: Mode {
         get { modeBox.get() }
@@ -1548,11 +2339,13 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCaptureVid
     private var lastPreviewLabelAt: TimeInterval = 0
     private var lastWindowTitleDevice: String?
 
-    init(store: FrameStore, modeBox: ModeBox, prestartedServer: HttpServer?) {
+    init(store: FrameStore, audioStore: AudioStore, modeBox: ModeBox, prestartedServer: HttpServer?) {
         self.store = store
+        self.audioStore = audioStore
         self.modeBox = modeBox
         self.server = prestartedServer
         super.init()
+        audioOutput.setSampleBufferDelegate(self, queue: audioQueue)
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -1601,6 +2394,17 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCaptureVid
                 }
                 return
             }
+            if self.currentAudioInput != nil && self.audioStore.isAvailable() {
+                let audio = self.audioStore.statusSnapshot()
+                let staleAudio = audio.capturedAtMs <= 0 || Date().timeIntervalSince1970 * 1000 - audio.capturedAtMs > 5_000
+                if !self.audioSession.isRunning || staleAudio {
+                    log("RECOVERING audio capture stalled; reopening audio session…")
+                    self.detachAudioInput(reason: "audio frame stream stalled")
+                    if let videoCard = self.device {
+                        self.attachAudioInput(videoCard: videoCard)
+                    }
+                }
+            }
             let snap = self.store.snapshot()
             let now = ProcessInfo.processInfo.systemUptime
             if snap.isConnected && snap.lastFrameUptime > 0 && (now - snap.lastFrameUptime) > 5.0 {
@@ -1648,7 +2452,10 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCaptureVid
         var barViews: [NSView] = []
         if isRemotePreview {
             video.configureForRemotePreview()
-            barViews = [status]
+            let muteButton = NSButton(title: audioMuted ? "Unmute" : "Mute", target: self, action: #selector(toggleAudioMute(_:)))
+            muteButton.bezelStyle = .rounded
+            self.audioMuteButton = muteButton
+            barViews = [status, muteButton]
         } else {
             video.preview.session = session
             let selector = NSPopUpButton(frame: .zero, pullsDown: false)
@@ -1718,6 +2525,15 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCaptureVid
                 }
             }
         )
+        let audioPlayer = PreviewAudioPlayer()
+        self.audioPlayer = audioPlayer
+        if audioPlayer.setup() {
+            let audioClient = RemoteAudioClient(baseURL: previewBaseURL, player: audioPlayer)
+            self.audioClient = audioClient
+            audioClient.start()
+        } else {
+            logError("AUDIO-PREVIEW unavailable; video preview continues")
+        }
         self.previewClient = client
         client.start()
     }
@@ -1758,12 +2574,37 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCaptureVid
         }
         session.commitConfiguration()
         device = nil
+        detachAudioInput(reason: "capture session torn down")
         store.setDisconnected()
+    }
+
+    private func detachAudioInput(reason: String) {
+        // Audio-only teardown: the video pipeline keeps running untouched.
+        if audioSession.isRunning { audioSession.stopRunning() }
+        audioSession.beginConfiguration()
+        if let input = currentAudioInput {
+            audioSession.removeInput(input)
+            currentAudioInput = nil
+        }
+        if audioSession.outputs.contains(audioOutput) {
+            audioSession.removeOutput(audioOutput)
+        }
+        audioSession.commitConfiguration()
+        audioDevice = nil
+        audioConverter = nil
+        audioConverterInputKey = ""
+        audioStore.clear()
+        audioStore.setUnavailable(reason: reason)
     }
 
     @objc func deviceWasDisconnected(_ notification: Notification) {
         guard let gone = notification.object as? AVCaptureDevice else { return }
         captureQueue.async {
+            if self.audioDevice?.uniqueID == gone.uniqueID {
+                log("AUDIO-DISCONNECTED \(gone.localizedName)")
+                self.detachAudioInput(reason: "audio device disconnected")
+                return
+            }
             guard self.device?.uniqueID == gone.uniqueID else { return }
             log("DISCONNECTED \(gone.localizedName)")
             self.tearDownCurrentSession()
@@ -1776,8 +2617,13 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCaptureVid
 
     @objc func deviceWasConnected(_ notification: Notification) {
         captureQueue.async {
-            guard self.device == nil else { return }
-            self.openCaptureDevice()
+            if self.device == nil {
+                self.openCaptureDevice()
+                return
+            }
+            if self.currentAudioInput == nil, let videoCard = self.device {
+                self.attachAudioInput(videoCard: videoCard)
+            }
         }
     }
 
@@ -1883,10 +2729,89 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCaptureVid
             store.setConnected(device: found, mode: targetMode, supportedModes: menuModes)
             syncSelector(modes: menuModes, selected: targetMode, deviceName: found.localizedName)
             log("RUNNING device=\"\(found.localizedName)\" model=\"\(found.modelID)\" mode=\(targetMode.id) supported=[\(menuModes.map(\.id).joined(separator: ","))]")
+            attachAudioInput(videoCard: found)
             DispatchQueue.main.async { self.statusLabel?.stringValue = "Capturing (\(found.localizedName) · \(targetMode.title))" }
         } catch {
             tearDownCurrentSession()
             showError(error.localizedDescription)
+        }
+    }
+
+    private func attachAudioInput(videoCard: AVCaptureDevice) {
+        guard currentAudioInput == nil else { return }
+        let authorization = AVCaptureDevice.authorizationStatus(for: .audio)
+        if authorization == .notDetermined {
+            guard !audioPermissionRequestInFlight else { return }
+            audioPermissionRequestInFlight = true
+            audioStore.setUnavailable(reason: "waiting for audio capture permission")
+            log("AUDIO-PERMISSION requesting access")
+            DispatchQueue.main.async {
+                if headless { NSApp.setActivationPolicy(.regular) }
+                NSApp.activate()
+                AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
+                    DispatchQueue.main.async {
+                        if headless { NSApp.setActivationPolicy(.prohibited) }
+                    }
+                    guard let self else { return }
+                    self.captureQueue.async {
+                        self.audioPermissionRequestInFlight = false
+                        guard self.device?.uniqueID == videoCard.uniqueID else { return }
+                        if granted {
+                            self.attachAudioInput(videoCard: videoCard)
+                        } else {
+                            self.audioStore.setUnavailable(reason: "audio capture permission denied")
+                            log("AUDIO-UNAVAILABLE audio capture permission denied")
+                        }
+                    }
+                }
+            }
+            return
+        }
+        guard authorization == .authorized else {
+            let reason = "audio capture permission denied; enable microphone access for switch2-capture"
+            audioStore.setUnavailable(reason: reason)
+            log("AUDIO-UNAVAILABLE \(reason)")
+            return
+        }
+        guard let foundAudio = pickAudioDevice(preferredName: requestedAudioDeviceName, videoCardName: videoCard.localizedName) else {
+            let query = requestedAudioDeviceName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let reason: String
+            if !query.isEmpty, query.lowercased() != "auto" {
+                reason = "no external audio device matching \"\(query)\""
+            } else {
+                reason = "no external audio device named \"\(videoCard.localizedName)\""
+            }
+            audioStore.setUnavailable(reason: reason)
+            log("AUDIO-UNAVAILABLE \(reason)")
+            return
+        }
+        do {
+            let input = try AVCaptureDeviceInput(device: foundAudio)
+            audioSession.beginConfiguration()
+            guard audioSession.canAddInput(input) else {
+                audioSession.commitConfiguration()
+                throw NSError(domain: "Switch2Capture", code: 3, userInfo: [
+                    NSLocalizedDescriptionKey: "Cannot attach audio input \(foundAudio.localizedName)"
+                ])
+            }
+            audioSession.addInput(input)
+            guard audioSession.canAddOutput(audioOutput) else {
+                audioSession.removeInput(input)
+                audioSession.commitConfiguration()
+                throw NSError(domain: "Switch2Capture", code: 4, userInfo: [
+                    NSLocalizedDescriptionKey: "Cannot attach audio output"
+                ])
+            }
+            audioSession.addOutput(audioOutput)
+            audioSession.commitConfiguration()
+            currentAudioInput = input
+            audioDevice = foundAudio
+            audioSession.startRunning()
+            audioStore.setConnected(device: foundAudio)
+            log("AUDIO-RUNNING device=\"\(foundAudio.localizedName)\" id=\"\(foundAudio.uniqueID)\"")
+        } catch {
+            audioStore.setUnavailable(reason: error.localizedDescription)
+            log("AUDIO-UNAVAILABLE \(error.localizedDescription)")
         }
     }
 
@@ -1927,6 +2852,10 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCaptureVid
     }
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        if output === audioOutput {
+            handleAudioSample(sampleBuffer)
+            return
+        }
         guard let pixel = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         let prevSeq = store.frameSequence
         store.store(pixel)
@@ -1941,6 +2870,158 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCaptureVid
         }
     }
 
+    @objc func toggleAudioMute(_ sender: NSButton) {
+        audioMuted.toggle()
+        sender.title = audioMuted ? "Unmute" : "Mute"
+        audioPlayer?.setMuted(audioMuted)
+    }
+
+    private func audioConverterFor(_ format: AVAudioFormat) -> AVAudioConverter? {
+        let asbd = format.streamDescription.pointee
+        let key = "\(asbd.mSampleRate)|\(asbd.mFormatID)|\(asbd.mFormatFlags)|\(asbd.mBytesPerPacket)|\(asbd.mFramesPerPacket)|\(asbd.mBytesPerFrame)|\(asbd.mChannelsPerFrame)|\(asbd.mBitsPerChannel)"
+        if let converter = audioConverter, audioConverterInputKey == key {
+            return converter
+        }
+        guard let converter = AVAudioConverter(from: format, to: canonicalAudioFormat) else {
+            return nil
+        }
+        audioConverter = converter
+        audioConverterInputKey = key
+        return converter
+    }
+
+    // Runs on the dedicated audioQueue only: bounded per-callback work (one copy in,
+    // one conversion out) so the realtime audio callback never blocks the video path.
+    private func handleAudioSample(_ sampleBuffer: CMSampleBuffer) {
+        audioCallbackCount += 1
+        let firstCallback = audioCallbackCount == 1
+        autoreleasepool {
+            guard let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer) else {
+                if firstCallback { log("AUDIO-DROP missing format description") }
+                return
+            }
+            let inputFormat = AVAudioFormat(cmAudioFormatDescription: formatDesc)
+            if firstCallback {
+                log("AUDIO-CALLBACK frames=\(CMSampleBufferGetNumSamples(sampleBuffer)) rate=\(inputFormat.sampleRate) channels=\(inputFormat.channelCount) format=\(inputFormat.commonFormat.rawValue) interleaved=\(inputFormat.isInterleaved)")
+            }
+            guard let converter = audioConverterFor(inputFormat) else {
+                if firstCallback { log("AUDIO-DROP converter creation failed") }
+                audioStore.setUnavailable(reason: "unsupported capture-card audio format; PCM conversion is unavailable")
+                return
+            }
+            let numSamples = CMSampleBufferGetNumSamples(sampleBuffer)
+            guard numSamples > 0,
+                  let source = pcmBuffer(fromSampleBuffer: sampleBuffer, format: inputFormat) else {
+                if firstCallback { log("AUDIO-DROP PCM input copy failed") }
+                audioStore.setUnavailable(reason: "unsupported or invalid capture-card PCM format; expected interleaved or planar integer/float PCM")
+                return
+            }
+            let ratio = Double(canonicalAudioSampleRate) / max(1, inputFormat.sampleRate)
+            let dstCapacity = AVAudioFrameCount((Double(numSamples) * ratio).rounded(.up)) + 16
+            guard let destination = AVAudioPCMBuffer(pcmFormat: canonicalAudioFormat, frameCapacity: dstCapacity) else {
+                return
+            }
+            var conversionError: NSError?
+            var fed = false
+            let status = converter.convert(to: destination, error: &conversionError, withInputFrom: { _, inputStatus in
+                if fed {
+                    inputStatus.pointee = .noDataNow
+                    return nil
+                }
+                fed = true
+                inputStatus.pointee = .haveData
+                return source
+            })
+            guard (status == .haveData || status == .inputRanDry), destination.frameLength > 0, let channels = destination.int16ChannelData else {
+                if firstCallback { log("AUDIO-DROP conversion status=\(status.rawValue) frames=\(destination.frameLength) error=\(conversionError?.localizedDescription ?? "none")") }
+                return
+            }
+            audioStore.append(
+                bytes: UnsafeRawPointer(channels[0]),
+                byteCount: Int(destination.frameLength) * canonicalAudioChannels * 2
+            )
+            if firstCallback { log("AUDIO-PCM frames=\(destination.frameLength) rate=48000 channels=2") }
+        }
+    }
+
+    private func pcmBuffer(fromSampleBuffer sampleBuffer: CMSampleBuffer, format: AVAudioFormat) -> AVAudioPCMBuffer? {
+        let numSamples = CMSampleBufferGetNumSamples(sampleBuffer)
+        guard numSamples > 0 else { return nil }
+        var listSize = 0
+        _ = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sampleBuffer,
+            bufferListSizeNeededOut: &listSize,
+            bufferListOut: nil,
+            bufferListSize: 0,
+            blockBufferAllocator: kCFAllocatorDefault,
+            blockBufferMemoryAllocator: kCFAllocatorDefault,
+            flags: kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
+            blockBufferOut: nil
+        )
+        guard listSize >= MemoryLayout<AudioBufferList>.size else { return nil }
+        let listPtr = UnsafeMutableRawPointer.allocate(byteCount: listSize, alignment: MemoryLayout<AudioBufferList>.alignment)
+        defer { listPtr.deallocate() }
+        let bufferList = listPtr.bindMemory(to: AudioBufferList.self, capacity: 1)
+        var blockBuffer: CMBlockBuffer?
+        let status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sampleBuffer,
+            bufferListSizeNeededOut: nil,
+            bufferListOut: bufferList,
+            bufferListSize: listSize,
+            blockBufferAllocator: kCFAllocatorDefault,
+            blockBufferMemoryAllocator: kCFAllocatorDefault,
+            flags: kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
+            blockBufferOut: &blockBuffer
+        )
+        if audioCallbackCount == 1 {
+            log("AUDIO-ABLIST status=\(status) blockBytes=\(blockBuffer.map { CMBlockBufferGetDataLength($0) } ?? -1)")
+        }
+        guard status == noErr, let blockBuffer, CMBlockBufferGetDataLength(blockBuffer) > 0 else {
+            return nil
+        }
+        guard let pcm = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(numSamples)) else {
+            return nil
+        }
+        pcm.frameLength = AVAudioFrameCount(numSamples)
+        let list = UnsafeMutableAudioBufferListPointer(bufferList)
+        if audioCallbackCount == 1 {
+            log("AUDIO-BUFFERS count=\(list.count) bytes=\(list.map { Int($0.mDataByteSize) }) dataPresent=\(list.map { $0.mData != nil })")
+        }
+        let channelCount = Int(format.channelCount)
+        let copied: Bool
+        switch format.commonFormat {
+        case .pcmFormatFloat32:
+            copied = copyAudioChannels(pcm.floatChannelData, from: list, frames: Int(numSamples), channels: channelCount)
+        case .pcmFormatInt16:
+            copied = copyAudioChannels(pcm.int16ChannelData, from: list, frames: Int(numSamples), channels: channelCount)
+        case .pcmFormatInt32:
+            copied = copyAudioChannels(pcm.int32ChannelData, from: list, frames: Int(numSamples), channels: channelCount)
+        default:
+            copied = false
+        }
+        return copied ? pcm : nil
+    }
+
+    private func copyAudioChannels<T>(_ destination: UnsafePointer<UnsafeMutablePointer<T>>?, from list: UnsafeMutableAudioBufferListPointer, frames: Int, channels: Int) -> Bool {
+        guard let destination, frames > 0, channels > 0, list.count >= 1 else { return false }
+        let sampleSize = MemoryLayout<T>.size
+        if list.count == 1 {
+            guard let src = list[0].mData else { return false }
+            let needed = frames * channels * sampleSize
+            guard list[0].mDataByteSize >= needed else { return false }
+            memcpy(destination[0], src, needed)
+            return true
+        }
+        guard list.count >= channels else { return false }
+        for channel in 0..<channels {
+            guard let src = list[channel].mData else { return false }
+            let needed = frames * sampleSize
+            guard list[channel].mDataByteSize >= needed else { return false }
+            memcpy(destination[channel], src, needed)
+        }
+        return true
+    }
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         return !headless
     }
@@ -1948,6 +3029,10 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate, AVCaptureVid
     func applicationWillTerminate(_ notification: Notification) {
         recoveryTimer?.cancel()
         recoveryTimer = nil
+        audioClient?.stop()
+        audioClient = nil
+        audioPlayer?.shutdown()
+        audioPlayer = nil
         previewClient?.stop()
         previewClient = nil
         server?.stop()
@@ -1967,13 +3052,14 @@ extension Array {
 }
 
 let sharedStore = FrameStore()
+let sharedAudioStore = AudioStore()
 let sharedModeBox = ModeBox(initialMode)
 var prestartedHttpServer: HttpServer?
 
 // Bind HTTP listener BEFORE initializing NSApplication or touching UVC hardware in capture mode.
 if !isPreviewClient {
     do {
-        let srv = try HttpServer(port: httpPort, store: sharedStore, fallbackModeProvider: {
+        let srv = try HttpServer(port: httpPort, store: sharedStore, audioStore: sharedAudioStore, fallbackModeProvider: {
             sharedModeBox.get()
         })
         switch srv.startAndWaitReady(timeout: 2.0) {
@@ -1990,7 +3076,7 @@ if !isPreviewClient {
 }
 
 let app = NSApplication.shared
-let delegate = App(store: sharedStore, modeBox: sharedModeBox, prestartedServer: prestartedHttpServer)
+let delegate = App(store: sharedStore, audioStore: sharedAudioStore, modeBox: sharedModeBox, prestartedServer: prestartedHttpServer)
 app.setActivationPolicy((headless && !isPreviewClient) ? .prohibited : .regular)
 app.delegate = delegate
 app.run()
